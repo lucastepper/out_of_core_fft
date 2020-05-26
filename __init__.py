@@ -106,7 +106,7 @@ except ImportError:
             return received_exc and suppressed_exc
 
 
-def transpose(dset_in, file_name_out, dset_name_out, chunk_cache_mem_size=1024**3, w0=1.0,
+def transpose(dset_in, file_name_out, dset_name_out, chunk_cache_mem_size=1024**3, w0=1.0, dtype=None,
               R2=None, C2=None, close_file_when_done=False, access_axis=1, show_progress=False):
     """Transpose large matrix in HDF5 for fast access on transposed row
 
@@ -136,6 +136,9 @@ def transpose(dset_in, file_name_out, dset_name_out, chunk_cache_mem_size=1024**
 
     chunk_cache_mem_size : int
     w0 : float
+
+    dtype : dtype for h5py dataset
+        Default is None. If None, dtype of dset_in is selected.
         Parameters passed to `h5py_File_with_cache`.  See that function's documentation.
 
     R2, C2 : int
@@ -161,6 +164,9 @@ def transpose(dset_in, file_name_out, dset_name_out, chunk_cache_mem_size=1024**
     import h5py
     import h5py_cache
 
+    if not dtype:
+        dtype = dset_in.dtype
+
     # Figure out the basic output sizes
     if R2 is None:
         if len(dset_in.shape)>1:
@@ -170,7 +176,7 @@ def transpose(dset_in, file_name_out, dset_name_out, chunk_cache_mem_size=1024**
     if C2 is None:
         C2 = dset_in.shape[0]
 
-    bytes_per_object = np.dtype(dset_in.dtype).itemsize
+    bytes_per_object = np.dtype(dtype).itemsize
     num_chunk_elements = chunk_cache_mem_size // bytes_per_object
     sqrt_n_c_e = int(np.sqrt(num_chunk_elements))
 
@@ -183,8 +189,8 @@ def transpose(dset_in, file_name_out, dset_name_out, chunk_cache_mem_size=1024**
         file_out = h5py.File(file_name_out, 'a')
         if dset_name_out in file_out:
             del file_out[dset_name_out]
-        dset_out = file_out.create_dataset(dset_name_out, shape=(R2, C2), dtype=dset_in.dtype)
-        dset_out[:] = dset_in[:].reshape(C2, R2).T
+        dset_out = file_out.create_dataset(dset_name_out, shape=(R2, C2), dtype=dtype)
+        dset_out[:] = (dset_in[:].reshape(C2, R2).T).astype(dtype)
 
     else:
 
@@ -200,17 +206,17 @@ def transpose(dset_in, file_name_out, dset_name_out, chunk_cache_mem_size=1024**
         file_out = h5py_cache.File(file_name_out, 'a', chunk_cache_mem_size, w0, n_cache_chunks)
         if dset_name_out in file_out:
             del file_out[dset_name_out]
-        dset_out = file_out.create_dataset(dset_name_out, shape=(R2, C2), dtype=dset_in.dtype, chunks=chunks)
+        dset_out = file_out.create_dataset(dset_name_out, shape=(R2, C2), dtype=dtype, chunks=chunks)
 
         # Depending on whether input is 1-D or 2-D, we do this differently
         if len(dset_in.shape)==1:
             def submatrix_dset_in(r2a, r2b, c2a, c2b):
-                temp = np.empty((c2b-c2a, r2b-r2a), dtype=dset_in.dtype)
+                temp = np.empty((c2b-c2a, r2b-r2a), dtype=dtype)
                 C1 = R2
                 c1a, c1b = r2a, r2b
                 for r1 in range(c2a, c2b):
                     try:
-                        temp[r1-c2a] = dset_in[r1*C1+c1a:r1*C1+c1b]
+                        temp[r1-c2a] = (dset_in[r1*C1+c1a:r1*C1+c1b]).astype(dtype)
                     except ValueError:
                         print(r2a, r2b, "\t", c2a, c2b, "\n", r1, c1a, c1b, "\t", C1)
                         print(r1-c2a, r1*C1+c1a, r1*C1+c1b, dset_in.shape, temp.shape)
@@ -218,7 +224,7 @@ def transpose(dset_in, file_name_out, dset_name_out, chunk_cache_mem_size=1024**
                 return temp
         else:
             def submatrix_dset_in(r2a, r2b, c2a, c2b):
-                return dset_in[c2a:c2b, r2a:r2b]
+                return (dset_in[c2a:c2b, r2a:r2b]).astype(dtype)
 
         # Do the transposition
         i = 1
@@ -288,18 +294,30 @@ def _general_fft(infile, ingroup, outfile='', outgroup='', overwrite=False, mem_
         else:
             f_in = context_managers.enter_context(h5py.File(infile, 'r'))
             f_out = context_managers.enter_context(h5py.File(outfile, 'w'))
+
         if overwrite:
             x = f_in[ingroup]
             if not issubclass(x.dtype.type, numbers.Complex):
                 raise ValueError("Flag `overwrite` is True, but input dtype={0} is not complex".format(x.dtype))
             X = x
+            dtype_out = x.dtype
         else:
             if infile == outfile and ingroup == outgroup:
                 raise ValueError("Flag `overwrite` is False, but input and output files and groups are the same")
             x = f_in[ingroup]
             if outgroup in f_out:
                 del f_out[outgroup]
-            X = f_out.create_dataset(outgroup, shape=x.shape, dtype=x.dtype, chunks=(min(sqrt_n_c_e, x.shape[0]),))
+
+            if x.dtype == 'float64':
+                dtype_out = 'complex128'
+            elif x.dtype == 'float32':
+                dtype_out = 'complex64'
+            elif issubclass(x.dtype, numbers.Real):
+                print('Input dataset needs to be complex or single or double')
+            else:
+                dtype_out = x.dtype
+
+            X = f_out.create_dataset(outgroup, shape=x.shape, dtype=dtype_out, chunks=(min(sqrt_n_c_e, x.shape[0]),))
 
         # Determine appropriate size and shape
         N = x.size
@@ -324,7 +342,7 @@ def _general_fft(infile, ingroup, outfile='', outgroup='', overwrite=False, mem_
         if show_progress:
             print("\t\tStep 1: Transposing input data")
         f_tmp1, y = transpose(x, fn_tmp1, 'temp_y', R2=C, C2=R, chunk_cache_mem_size=mem_limit,
-                              show_progress=show_progress)
+                              show_progress=show_progress, dtype=dtype_out)
 
         # Steps 2 and 3:
         #   2) Compute DFT of each R-element row individually
